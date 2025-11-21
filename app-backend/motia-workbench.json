@@ -1,0 +1,40 @@
+[
+  {
+    "id": "hello-world-flow",
+    "config": {
+      "steps/hello/process-greeting.step.ts": {
+        "x": 392,
+        "y": -32
+      },
+      "steps/hello/hello-api.step.ts": {
+        "x": -37,
+        "y": -68
+      }
+    }
+  },
+  {
+    "id": "metrics-dashboard",
+    "config": {
+      "steps/metrics/refresh-metrics-cron.step.ts": {
+        "x": 0,
+        "y": 0
+      },
+      "steps/metrics/project-overview.step.ts": {
+        "x": 41,
+        "y": 294
+      },
+      "steps/metrics/metrics-timeseries.step.ts": {
+        "x": 19,
+        "y": 649
+      },
+      "steps/metrics/metrics-overview.step.ts": {
+        "x": -460,
+        "y": 54
+      },
+      "steps/metrics/metrics-by-chain.step.ts": {
+        "x": -474,
+        "y": 334
+      }
+    }
+  }
+]

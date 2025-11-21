@@ -1,0 +1,420 @@
+Ok. Giờ đóng hồ sơ lại gọn gàng trước khi làm bước tiếp.
+Anh có thể copy nguyên cái này vào docs của OriginStake luôn.
+
+⸻
+
+1. Tổng quan kiến trúc
+
+Mục tiêu
+• Gom log HTTP từ Kong Gateway
+• Chuẩn hoá thành schema ổn định. không phụ thuộc vào version Kong
+• Sinh metrics Prometheus để:
+• Đếm request theo chain, network, endpoint, consumer, status
+• Theo dõi latency. lỗi. slow request
+• Chuẩn bị data cho rate limit / quota về sau
+
+Luồng dữ liệu 1. Client gọi RPC qua Cloudflare → Kong Gateway 2. Kong route request đến backend RPC node (0G, sau này Monad, Somnia, v.v.) 3. Kong HTTP Log Plugin gửi log JSON về Vector qua HTTP 4. Vector:
+• source.kong_http_log nhận JSON
+• transform.normalize viết bằng VRL để:
+• Chuẩn hoá field (status, method, path, latency, consumer, apikey…)
+• Thêm field multi-chain: chain, network, rpc_kind, route_key
+• Gắn cờ ok, is_error, error_class, is_slow
+• transform.to_metrics chuyển log → metrics Prometheus
+• sink.prometheus_exporter expose metrics tại :9598/metrics
+
+Khi Prometheus được cấu hình scrape vector:9598, Grafana chỉ cần query trên bộ metric kong\_\* là đủ để vẽ dashboard.
+
+⸻
+
+2. Cấu trúc Vector hiện tại
+
+2.1. Source
+
+sources:
+kong_http_log:
+type: http_server
+address: 0.0.0.0:9880
+decoding:
+codec: json
+
+    •	Kong HTTP Log plugin http://vector:9880/
+    •	Body log là JSON raw từ Kong.
+
+2.2. Transform: normalize (VRL)
+
+Nhiệm vụ chính: 1. Thời gian
+
+.ts = now()
+
+    2.	Status code
+
+    •	Đọc từ .response.status hoặc .status
+    •	Coerce sang int, nếu lỗi thì về 0
+    •	Kết quả lưu ở .status
+
+    3.	Method
+
+    •	Ưu tiên .request.method
+    •	Fallback .method
+    •	Kết quả: .method là string
+
+    4.	Path và path_label
+
+    •	.path:
+    •	Ưu tiên .request.uri
+    •	Fallback .path, default /
+    •	.path_label:
+    •	Nếu có ? thì cắt query:
+    •	/v1/0g/mainnet/block?height=123 → /v1/0g/mainnet/block
+    •	Nếu không có ? thì .path_label = .path
+
+    5.	Client IP
+
+    •	Ưu tiên .client_ip
+    •	Fallback .ip
+    •	Kết quả: .ip
+
+    6.	Route / Service
+
+    •	.route lấy từ .route_name nếu có
+    •	.service lấy từ .service_name nếu có
+    •	Nếu không thì để ""
+
+    7.	Consumer + apikey
+
+    •	consumer_id:
+    •	.consumer_id hoặc header x-consumer-id
+    •	consumer:
+    •	.consumer_username hoặc header x-consumer-username
+    •	apikey:
+    •	Thử lần lượt:
+    •	.apikey
+    •	header apikey
+    •	header api_key
+    •	header x-api-key
+    •	Nếu không có, để ""
+
+    8.	Latency
+
+    •	Đọc từ:
+    •	.proxy_latency_ms hoặc .latencies.proxy → lat_p
+    •	.upstream_latency_ms hoặc .latencies.request → lat_u
+    •	Coerce int, nếu lỗi thì về 0
+    •	Ghi ra:
+    •	.proxy_latency_ms = lat_p
+    •	.upstream_latency_ms = lat_u
+    •	.latency_ms = lat_p + lat_u
+
+    9.	Cờ OK / error
+
+if status_val >= 200 && status_val < 400 {
+.ok = true
+} else {
+.ok = false
+}
+
+    •	Error flags:
+
+.is_error = 0
+.error_class = "none"
+
+if status_val >= 400 && status_val < 500 {
+.is_error = 1
+.error_class = "4xx_client"
+} else if status_val >= 500 {
+.is_error = 1
+.error_class = "5xx_server"
+}
+
+    10.	Multi chain fields
+
+.chain = ""
+.network = ""
+.rpc_kind = "generic"
+.route_key = .path_label
+
+    •	Parse chain và network từ path_label theo format /v1/{chain}/{network}/...:
+
+path_label_safe = to_string(.path_label)
+segments = split!(path_label_safe, "/")
+
+if length(segments) >= 4 && segments[1] == "v1" {
+.chain = to_string!(segments[2])
+.network = to_string!(segments[3])
+}
+
+    •	Xác định loại RPC rpc_kind:
+
+if ends_with(path_label_safe, "/status") || contains(path_label_safe, "/block") {
+.rpc_kind = "tendermint"
+} else {
+.rpc_kind = "generic"
+}
+
+    11.	Kong internal latency
+
+kong_lat = 0
+err = null
+
+if exists(.latencies) && exists(.latencies.kong) && !is_null(.latencies.kong) {
+kong_lat, err = to_int(.latencies.kong)
+if err != null {
+kong_lat = 0
+}
+}
+
+.kong_latency_ms = kong_lat
+
+    12.	Slow request
+
+.is_slow = 0
+if .latency_ms > 2000 {
+.is_slow = 1
+}
+
+    13.	Request counter
+
+Để metric kong_requests_total là đếm số request:
+
+.request_count = 1
+
+2.3. Transform: to_metrics
+
+to_metrics:
+type: log_to_metric
+inputs: - normalize
+metrics: # Đếm request - type: counter
+field: request_count
+name: kong_requests_total
+tags:
+method: "{{method}}"
+path: "{{path_label}}"
+route: "{{route_key}}"
+consumer: "{{consumer}}"
+status: "{{status}}"
+chain: "{{chain}}"
+network: "{{network}}"
+rpc_kind: "{{rpc_kind}}"
+
+      # Latency tổng
+      - type: gauge
+        field: latency_ms
+        name: kong_request_latency_ms
+        tags: *same_common_tags
+
+      # Upstream latency
+      - type: gauge
+        field: upstream_latency_ms
+        name: kong_upstream_latency_ms
+        tags: *same_common_tags
+
+      # Proxy latency
+      - type: gauge
+        field: proxy_latency_ms
+        name: kong_proxy_latency_ms
+        tags: *same_common_tags
+
+      # Kong internal latency
+      - type: gauge
+        field: kong_latency_ms
+        name: kong_internal_latency_ms
+        tags: *same_common_tags
+
+      # Error counter
+      - type: counter
+        field: is_error
+        name: kong_request_errors_total
+        tags:
+          <<: *same_common_tags
+          error_class: "{{error_class}}"
+
+      # Slow requests
+      - type: counter
+        field: is_slow
+        name: kong_slow_requests_total
+        tags: *same_common_tags
+
+(Ở file thật thì lặp lại block tags thay vì dùng alias YAML cho đỡ rối)
+
+2.4. Sinks
+
+sinks:
+console_logs:
+type: console
+inputs: - normalize
+encoding:
+codec: json
+
+prometheus_metrics:
+type: prometheus_exporter
+inputs: - to_metrics
+address: 0.0.0.0:9598
+default_namespace: kong
+flush_period_secs: 15
+
+⸻
+
+3. Cách thêm endpoint mới
+
+3.1. Thêm RPC mới cùng chain / network
+
+Ví dụ hiện có:
+• /v1/0g/mainnet/status
+• /v1/0g/mainnet/block
+
+Muốn thêm:
+• /v1/0g/mainnet/abci_info
+• /v1/0g/mainnet/tx
+
+Không cần đụng Vector.
+Chỉ cần: 1. Thêm route trong Kong với URL pattern đó 2. Gắn HTTP Log plugin vào route hoặc service đó (log vẫn bắn về vector:9880)
+
+Transform sẽ tự:
+• Parse chain = "0g"
+• network = "mainnet"
+• route_key = "/v1/0g/mainnet/abci_info"
+• Tag metric với path_label = "/v1/0g/mainnet/abci_info"
+
+3.2. Thêm chain / network mới
+
+Ví dụ Monad mainnet:
+• Route: /v1/monad/mainnet/eth_blockNumber
+
+Chỉ cần giữ format:
+
+/v1/{chain}/{network}/...
+
+Transform sẽ tự:
+• chain = "monad"
+• network = "mainnet"
+
+Không cần sửa VRL, metric vẫn có tag chain="monad", network="mainnet".
+
+Nếu một ngày anh cần route kiểu khác, ví dụ:
+• /monad/mainnet/v1/rpc
+
+Thì chỉ cần chỉnh block parse:
+
+segments = split!(path_label_safe, "/")
+
+# Ví dụ format mới
+
+if length(segments) >= 4 && segments[0] == "" && segments[1] == "monad" {
+.chain = to_string!(segments[1])
+.network = to_string!(segments[2])
+}
+
+Nhưng hiện tại anh đang thống nhất /v1/{chain}/{network}/... nên cứ vậy mà chơi là dễ nhất.
+
+3.3. Thêm loại RPC mới (rpc_kind)
+
+Hiện tại:
+
+if ends_with(path_label_safe, "/status") || contains(path_label_safe, "/block") {
+.rpc_kind = "tendermint"
+} else {
+.rpc_kind = "generic"
+}
+
+Ví dụ sau có Monad JSON-RPC:
+• /v1/monad/mainnet nhận payload JSON {"method":"eth_blockNumber", ...}
+Anh có thể mở rộng:
+
+if ends_with(path_label_safe, "/status") || contains(path_label_safe, "/block") {
+.rpc_kind = "tendermint"
+} else if .chain == "monad" && .network == "mainnet" {
+.rpc_kind = "evm"
+} else {
+.rpc_kind = "generic"
+}
+
+Hoặc chi tiết hơn theo path, service, v.v.
+Sau đó, Grafana có thể filter: rpc_kind="tendermint" vs rpc_kind="evm".
+
+⸻
+
+4. Cách test và debug
+
+4.1. Kiểm tra Vector up
+
+Trên host:
+
+docker logs --tail 50 -f vector
+
+Thấy:
+• Healthcheck passed
+• HTTP server 0.0.0.0:9880
+• Prometheus exporter 0.0.0.0:9598
+
+là OK.
+
+4.2. Test source + transform bằng HTTP trực tiếp
+
+Gửi một log giả:
+
+curl -X POST http://localhost:9880/ \
+ -H "Content-Type: application/json" \
+ -d '{"status":200,"request":{"method":"GET","uri":"/v1/testchain/devnet/status"},"latencies":{"proxy":10,"request":20},"client_ip":"1.2.3.4"}'
+
+Rồi xem log Vector:
+
+docker logs --tail 50 vector
+
+Anh sẽ thấy bản log đã normalize có đủ:
+• chain: "testchain"
+• network: "devnet"
+• rpc_kind, latency_ms, is_error, is_slow, route_key, v.v.
+
+4.3. Test real RPC qua Kong
+
+Ví dụ 0G mainnet:
+
+APIKEY="..." # key của user_001
+BASE="https://infra.originstake.com/v1/0g/mainnet"
+
+# 1. Status OK nhưng chậm
+
+curl -s -H "apikey: $APIKEY" "$BASE/status" > /dev/null
+
+# 2. Block OK
+
+curl -s -H "apikey: $APIKEY" "$BASE/block?height=1" > /dev/null
+
+# 3. 404
+
+curl -s -H "apikey: $APIKEY" "$BASE/does-not-exist" > /dev/null
+
+# 4. 500 (block quá lớn)
+
+curl -s -H "apikey: $APIKEY" "$BASE/block?height=999999999999" > /dev/null
+
+Sau đó:
+• Xem log normalize:
+
+docker logs --tail 50 vector
+
+    •	Kiểm tra metrics:
+
+curl -s http://localhost:9598/metrics | grep kong\_
+
+Anh sẽ thấy các metric dạng:
+• kong_requests_total{chain="0g",network="mainnet",route="/v1/0g/mainnet/block",status="200",consumer="user_001",rpc_kind="tendermint"}
+• kong_request_errors_total{status="404",error_class="4xx_client",...}
+• kong_slow_requests_total{...}
+• kong_request_latency_ms{...} v.v.
+
+⸻
+
+5. Tóm tắt những gì đã ổn
+   • Schema normalized đủ xài cho multi-chain / multi-network
+   • Tách được:
+   • Success vs error (4xx, 5xx)
+   • Slow vs normal request
+   • Tendermint RPC vs generic
+   • Tag đầy đủ: chain, network, rpc_kind, route_key, consumer, status, method
+   • Metrics Prometheus đã expose sẵn để vẽ dashboard, cũng như để sau này dùng cho rate-limit control / pricing theo chain hoặc theo user.
+
+Từ docs này, bước tiếp theo mình có thể chuyển sang:
+• Thiết kế Prometheus recording rules
+• Draft dashboard Grafana (per chain, per consumer, per endpoint)
+• Và sau đó là logic limit/quota dựa trên metric.

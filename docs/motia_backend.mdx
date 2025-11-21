@@ -1,0 +1,363 @@
+Dưới đây là bản tài liệu Markdown đầy đủ. Bạn copy-paste nguyên khối vào Notion/GitHub wiki cho team dùng luôn.
+Cấu trúc rõ ràng. tách module. dễ onboard dev FE + BE + data.
+
+⸻
+
+OriginStake RPC Dashboard — Architecture Specification
+
+Version: 1.0
+Author: OriginStake Infra
+Last updated: {{today}}
+
+⸻
+
+1. Overview
+
+OriginStake RPC Dashboard là hệ thống quan sát và giám sát (observability + analytics) cho multi-chain RPC infrastructure của OriginStake.
+Hệ thống gồm 3 phần: 1. Data Layer (ClickHouse) — Lưu logs & metrics từ Kong/Vector. 2. Metrics Backend (Motia) — Query. aggregate. realtime push to frontend. 3. Frontend Dashboard (Next.js + shadcn) — Hiển thị, charts, realtime counters.
+
+⸻
+
+2. Data Pipeline
+
+Kong / RPC Gateway
+↓ (logs)
+Vector Agents
+↓
+ClickHouse (rpc_logs → rpc_metrics_5s)
+↓
+Motia Backend (Cron + API + Streams)
+↓
+Next.js Client (poll + realtime stream)
+
+⸻
+
+3. ClickHouse Schema
+
+3.1. Raw Logs Table (rpc_logs)
+
+Dùng để lưu toàn bộ request RPC — phục vụ phân tích chi tiết, debugging, khả năng mở rộng.
+
+CREATE TABLE rpc_logs (
+ts DateTime,
+chain LowCardinality(String),
+env LowCardinality(String),
+region LowCardinality(String),
+endpoint_id String,
+project_id String,
+api_key_id String,
+method LowCardinality(String),
+status_code UInt16,
+error_class LowCardinality(String),
+latency_ms UInt32,
+bytes_in UInt32,
+bytes_out UInt32,
+client_ip_hash FixedString(32),
+user_agent String
+)
+ENGINE = MergeTree
+PARTITION BY toDate(ts)
+ORDER BY (ts, chain, env, project_id, api_key_id);
+
+Mục đích
+• Không query trực tiếp cho dashboard.
+• Nguồn để làm Materialized Views.
+
+⸻
+
+3.2. Metrics Table (5s bucket) — rpc_metrics_5s
+
+Dùng cho dashboard → gần realtime.
+
+Materialized View từ rpc_logs.
+
+Table
+
+CREATE TABLE rpc_metrics_5s (
+bucket_start DateTime,
+chain LowCardinality(String),
+env LowCardinality(String),
+region LowCardinality(String),
+project_id String,
+endpoint_id String,
+total_requests UInt64,
+success_requests UInt64,
+error_requests UInt64,
+bytes_in_sum UInt64,
+bytes_out_sum UInt64,
+latency_p50 Float32,
+latency_p95 Float32
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toDate(bucket_start)
+ORDER BY (bucket_start, chain, env, region, project_id, endpoint_id);
+
+Materialized View (pseudo)
+
+CREATE MATERIALIZED VIEW mv_rpc_metrics_5s
+TO rpc_metrics_5s AS
+SELECT
+toStartOfFiveSecond(ts) AS bucket_start,
+chain,
+env,
+region,
+project_id,
+endpoint_id,
+count() AS total_requests,
+countIf(status_code BETWEEN 200 AND 299) AS success_requests,
+countIf(status_code >= 400) AS error_requests,
+sum(bytes_in) AS bytes_in_sum,
+sum(bytes_out) AS bytes_out_sum,
+quantile(0.50)(latency_ms) AS latency_p50,
+quantile(0.95)(latency_ms) AS latency_p95
+FROM rpc_logs
+GROUP BY bucket_start, chain, env, region, project_id, endpoint_id;
+
+⸻
+
+4. Motia Backend Architecture
+
+Motia sẽ làm nhiệm vụ:
+• Query ClickHouse
+• Aggregate metrics
+• Expose APIs
+• Push realtime updates qua Streams
+• Chạy định kỳ qua Cron Steps
+
+⸻
+
+4.1. Streams Design
+
+Motia Streams cho phép push realtime event xuống frontend.
+
+4.1.1. Stream: metricsOverview
+
+Key: "global"
+
+Value shape:
+
+{
+totalRequests24h: number
+currentRps: number
+errorRate: number
+uptime30d: number
+updatedAt: string
+}
+
+⸻
+
+4.1.2. Stream: metricsByChain
+
+Key: "<chain>-<env>"
+Ví dụ: "story-mainnet", "monad-testnet"
+
+Value shape:
+
+{
+chain: string
+env: string
+region: string
+requests24h: number
+currentRps: number
+errorRate: number
+latencyP50: number
+latencyP95: number
+updatedAt: string
+}
+
+⸻
+
+4.2. Cron Steps
+
+4.2.1. RefreshRpcMetricsStep (Cron)
+
+Schedule: every 5 seconds
+Type: cron
+
+Nhiệm vụ: 1. Query ClickHouse bảng rpc_metrics_5s lấy dữ liệu gần nhất. 2. Cập nhật stream:
+
+streams.metricsOverview.set("global", overviewData)
+streams.metricsByChain.set("story-mainnet", chainData)
+
+    3.	Optionally: cập nhật vào state để API đọc nhanh.
+
+⸻
+
+4.3. API Steps
+
+4.3.1. GET /metrics/overview
+
+Trả về snapshot tổng quan cho homepage/dashboard.
+
+Response:
+
+{
+"totalRequests24h": 123456789,
+"currentRps": 1345.6,
+"errorRate": 0.0123,
+"uptime30d": 0.9995,
+"window": {
+"from": "2025-11-19T00:00:00Z",
+"to": "2025-11-19T16:02:00Z"
+},
+"generatedAt": "2025-11-19T16:02:00Z"
+}
+
+⸻
+
+4.3.2. GET /metrics/by-chain
+
+Query params:
+• chain (optional)
+• env (optional)
+
+Response:
+
+{
+"env": "mainnet",
+"generatedAt": "2025-11-19T16:02:00Z",
+"items": [
+{
+"chain": "story",
+"label": "Story Mainnet",
+"env": "mainnet",
+"region": "global",
+"requests24h": 3456789,
+"currentRps": 234.5,
+"errorRate": 0.008,
+"latencyP50": 42.1,
+"latencyP95": 85.3
+}
+]
+}
+
+⸻
+
+4.3.3. GET /metrics/timeseries
+
+Dùng cho charts.
+
+Query params:
+• chain
+• env
+• from
+• to
+• resolution → 5s, 1m, 5m
+
+Response:
+
+{
+"chain": "story",
+"env": "mainnet",
+"resolution": "1m",
+"points": [
+{
+"ts": "2025-11-19T12:00:00Z",
+"requests": 1234,
+"errors": 12,
+"latencyP95": 85.0
+}
+]
+}
+
+⸻
+
+4.3.4. GET /metrics/projects/overview
+
+Trả về metrics riêng cho một customer/project.
+
+Response ví dụ:
+
+{
+"projectId": "abcd-1234",
+"requests30d": 901234,
+"requests24h": 12345,
+"currentRps": 12.5,
+"topChains": [
+{ "chain": "story", "requests": 9000 },
+{ "chain": "monad", "requests": 3000 }
+]
+}
+
+⸻
+
+5. Frontend (Next.js) Integration
+
+5.1. SSR (initial load)
+• Gọi /metrics/overview
+• Gọi /metrics/by-chain
+• Gọi /metrics/timeseries (optional)
+• Render layout ban đầu
+
+⸻
+
+5.2. Realtime (client-side)
+
+Subscribe streams
+
+Frontend kết nối:
+
+const stream = connectToStream("metricsOverview")
+stream.subscribe("global", (data) => {
+setMetrics(data)
+})
+
+Animate counters
+
+Giữa các lần stream update:
+• dùng currentRps để tăng totalRequests mượt mà.
+
+⸻
+
+6.  Summary Diagram
+
+         ┌────────────────────┐
+         │       Kong         │
+         └─────────┬──────────┘
+                   │ logs
+                   ▼
+           ┌──────────────┐
+           │    Vector     │
+           └───────┬───────┘
+                   │
+                   ▼
+
+    ┌─────────────────────────┐
+    │ ClickHouse │
+    │ rpc_logs → rpc_metrics │
+    └──────────┬──────────────┘
+    │
+    Cron Step (5s)
+    │
+    ┌──────────▼──────────┐
+    │ Motia │
+    │ - Streams │
+    │ - API Steps │
+    └──────────┬──────────┘
+    │
+    WebSocket / REST Polling
+    │
+    ▼
+    ┌───────────────────┐
+    │ Next.js │
+    │ RPC Dashboard │
+    └───────────────────┘
+
+⸻
+
+7. Done — READY FOR TEAM
+
+Tài liệu này đủ để:
+• Dev backend tạo Motia steps
+• Dev data tạo CH schema + MV
+• Dev frontend implement dashboard & realtime stream
+• Designer hiểu API shape để mock UI
+
+Nếu bạn muốn mình mở rộng thêm:
+• Bảng project_config
+• Schema endpoint mapping
+• Alerting flow (Telegram)
+• Logs search API (backend pagination)
+• Billing metering spec
+
+Chỉ cần nói.
